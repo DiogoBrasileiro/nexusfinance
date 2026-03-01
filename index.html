@@ -1,8 +1,7 @@
 <!DOCTYPE html>
 <html lang="pt-BR">
 <head>
-<meta charset="UTF-8"/>
-<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover"/>
+<meta charset="UTF-8"/><meta name="viewport" content="width=device-width,initial-scale=1.0,viewport-fit=cover"/>
 <title>Nexus Finance — Mesa de Operações</title>
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>₿</text></svg>"/>
 <link rel="preconnect" href="https://fonts.googleapis.com"/>
@@ -947,11 +946,7 @@ input, select, button, textarea { font-family: 'Outfit', sans-serif; }
   .qa-icon-wrap .icon-inner { font-size: 22px; }
   .mkt-grid { grid-template-columns: 1fr 1fr; }
 }
-</style>
-</head>
-<body>
-<div id="app"></div>
-<script>// ================================================================
+</style></head><body><div id="app"></div><script>// ================================================================
 // NEXUS FINANCE v3.0 - MESA DE OPERAÇÕES
 // ================================================================
 var APP_VERSION = '3.0.0';
@@ -1050,10 +1045,28 @@ var ST = {
   btcProgress: [],
   btcAgentOutputs: {},
   btcFactChecker: null,
-  btcFactTs: null
+  btcFactTs: null,
+  // Auto-refresh + freshness
+  btcAutoRefresh: storeGet('cio_btc_autorefresh', true),
+  btcFreshness: null,         // { age_s, status, price_ts, partial, notes, latency_ms }
+  btcDsUrl: storeGetStr('cio_btc_ds_url', ''),  // Data Service base URL
+  _btcTimerTick: 0            // increments to force HUD re-render
 };
 
-function setState(partial) { Object.assign(ST, partial); render(); }
+function setState(partial) {
+  var oldPage = ST.page;
+  Object.assign(ST, partial);
+  // Iniciar/parar polling BTC ao navegar para /btc
+  if (partial.page !== undefined) {
+    if (partial.page === 'btc') {
+      startBtcPolling();
+      if (!ST.btcFreshness && !ST.snapshotLoading) { fetchBtcFull(); }
+    } else if (oldPage === 'btc') {
+      stopBtcPolling();
+    }
+  }
+  render();
+}
 function stateSet(partial) { Object.assign(ST, partial); }
 
 // ================================================================
@@ -1570,13 +1583,27 @@ function runBtcPipeline() {
 
   // Fetch snapshot + BTC candles in parallel
   var tf1 = (params.timeframes || ['1h'])[0] || '1h';
+  // C1: verificar freshness antes de começar
+  var guardPre = assertBtcFresh();
+  if (!guardPre.ok && ST.btcFreshness) {
+    // Tenta atualizar antes de bloquear
+    addLog('BTC_PIPELINE', 'warn', 'Dados ' + (ST.btcFreshness.status) + ' — atualizando antes de analisar');
+  }
+  var fetchSnap = ST.snapshot && ST.btcFreshness && ST.btcFreshness.status === 'ok'
+    ? Promise.resolve(ST.snapshot)
+    : fetchBtcFull().then(function(){ return ST.snapshot; }).catch(function(){ return fetchAllMarketData(); });
+
   Promise.all([
-    ST.snapshot ? Promise.resolve(ST.snapshot) : fetchAllMarketData(),
+    fetchSnap || fetchAllMarketData(),
     fetchBTCCandles(tf1, 50)
   ]).then(function(results) {
-    var snap = results[0];
+    var snap = results[0] || ST.snapshot;
     var candles = results[1] || [];
-    stateSet({ snapshot: snap });
+    // C2: log freshness at pipeline start
+    var fresh2 = calcBtcFreshness(snap);
+    addLog('BTC_PIPELINE_START', fresh2.status === 'ok' ? 'ok' : 'warn',
+      'age:' + fresh2.age_s + 's status:' + fresh2.status + ' src:' + (fresh2.provider||'direct') + ' latency:' + (snap.latency_ms||'?') + 'ms');
+    stateSet({ snapshot: snap, btcFreshness: fresh2 });
     progress[0] = { label: '✓ BTC snapshot + candles recebidos (' + candles.length + ' velas)', status: 'done' };
 
     // Attach candles to snap for agents
@@ -1746,6 +1773,240 @@ function buildCompactBundle(bundle) {
     compact[k] = txt.slice(0, 1000);
   });
   return compact;
+}
+
+// ================================================================
+// B1+B2: BTC POLLING ENGINE + FRESHNESS
+// ================================================================
+
+// Timers globais de polling
+var _btcTimerFast = null;   // 10s — apenas price/ticker
+var _btcTimerFull = null;   // 60s — snapshot completo com candles
+
+// Calcular freshness a partir do snapshot BTC
+function calcBtcFreshness(snap) {
+  if (!snap) return { age_s: null, status: 'offline', partial: false, notes: [] };
+  var btc = snap.prices && snap.prices['BTCUSDT'];
+  var priceTs = (snap.realtime && snap.realtime.price_ts) || (btc && btc.source_ts) || snap.ts;
+  var age_s = priceTs ? Math.round((Date.now() - new Date(priceTs).getTime()) / 1000) : null;
+  var partial = !!(snap.quality && snap.quality.partial);
+  var notes = (snap.quality && snap.quality.notes) || [];
+  var status;
+  if (!btc || !btc.last)       status = 'offline';
+  else if (age_s > 30)         status = 'stale';
+  else if (partial)            status = 'partial';
+  else if (age_s <= 15)        status = 'ok';
+  else                         status = 'partial';
+  return { age_s: age_s, status: status, price_ts: priceTs, partial: partial, notes: notes,
+           latency_ms: snap.latency_ms || null, provider: snap.source ? snap.source.provider : 'binance' };
+}
+
+// Fetch rápido apenas price (10s polling) — usa Data Service ou Binance direto
+function fetchBtcTickerFast() {
+  var dsUrl = ST.btcDsUrl;
+  var t0 = Date.now();
+  var fetchPr;
+  if (dsUrl) {
+    fetchPr = fetch(dsUrl.replace(/\/$/, '') + '/ticker')
+      .then(function(r) { return r.json(); })
+      .then(function(d) {
+        var btc = d && d.data;
+        if (!btc) return;
+        var snap = ST.snapshot ? JSON.parse(JSON.stringify(ST.snapshot)) : { prices: {}, macro_br: {}, ts: new Date().toISOString(), quality: { partial: false, notes: [] } };
+        snap.prices['BTCUSDT'] = {
+          last: btc.last, chg24h_pct: btc.chg24h_pct, volume: btc.vol24h,
+          high: btc.high24h, low: btc.low24h, source: 'binance_spot', source_ts: btc.fetched_at
+        };
+        snap.realtime = { price_ts: btc.fetched_at };
+        snap.latency_ms = Date.now() - t0;
+        snap.quality.partial = d.stale || false;
+        snap.ts = new Date().toISOString();
+        var fresh = calcBtcFreshness(snap);
+        addLog('BTC_TICKER_FAST', fresh.status === 'ok' ? 'ok' : 'warn',
+          'age:' + fresh.age_s + 's lat:' + (Date.now()-t0) + 'ms status:' + fresh.status + ' src:binance_spot');
+        stateSet({ snapshot: snap, btcFreshness: fresh, _btcTimerTick: (ST._btcTimerTick||0)+1 });
+        if (ST.page === 'btc') render();
+      }).catch(function() {});
+  } else {
+    // Fallback direto Binance
+    fetchPr = fetch('https://api.binance.com/api/v3/ticker/24hr?symbol=BTCUSDT')
+      .then(function(r) { return r.json(); })
+      .then(function(d) {
+        var snap = ST.snapshot ? JSON.parse(JSON.stringify(ST.snapshot)) : { prices: {}, macro_br: {}, ts: new Date().toISOString(), quality: { partial: false, notes: [] } };
+        var nowIso = new Date().toISOString();
+        snap.prices['BTCUSDT'] = {
+          last: parseFloat(d.lastPrice), chg24h_pct: parseFloat(d.priceChangePercent),
+          volume: parseFloat(d.volume), high: parseFloat(d.highPrice), low: parseFloat(d.lowPrice),
+          source: 'binance_direct', source_ts: nowIso
+        };
+        snap.realtime = { price_ts: nowIso };
+        snap.latency_ms = Date.now() - t0;
+        snap.ts = nowIso;
+        var fresh = calcBtcFreshness(snap);
+        addLog('BTC_TICKER_FAST', 'ok', 'age:' + fresh.age_s + 's lat:' + (Date.now()-t0) + 'ms src:binance_direct');
+        stateSet({ snapshot: snap, btcFreshness: fresh, _btcTimerTick: (ST._btcTimerTick||0)+1 });
+        if (ST.page === 'btc') render();
+      }).catch(function() {});
+  }
+  return fetchPr;
+}
+
+// Fetch completo — usa Data Service ou stack atual
+function fetchBtcFull() {
+  var dsUrl = ST.btcDsUrl;
+  var params = ST.btcParams || { timeframes: ['1h','4h'] };
+  var tf = (params.timeframes || ['1h'])[0] || '1h';
+  var t0 = Date.now();
+  if (dsUrl) {
+    var url = dsUrl.replace(/\/$/, '') + '/snapshot?symbols=BTCUSDT&include=macro&tf=' + (params.timeframes||['1h','4h']).join(',') + '&limit=50';
+    return fetch(url)
+      .then(function(r) { return r.json(); })
+      .then(function(d) {
+        // Normalizar resposta do Data Service para formato interno
+        var snap = {
+          ts:        d.ts_server,
+          realtime:  d.realtime || {},
+          source:    d.source,
+          prices:    {},
+          macro_br:  {},
+          btcCandles:{},
+          quality:   d.quality || { partial: false, notes: [] },
+          latency_ms:Date.now() - t0
+        };
+        // Mapear prices
+        if (d.prices) {
+          if (d.prices.BTCUSDT) {
+            snap.prices['BTCUSDT'] = {
+              last: d.prices.BTCUSDT.last, chg24h_pct: d.prices.BTCUSDT.chg24h_pct,
+              volume: d.prices.BTCUSDT.vol24h, high: d.prices.BTCUSDT.high24h,
+              low: d.prices.BTCUSDT.low24h, source_ts: d.prices.BTCUSDT.source_ts,
+              source: 'binance_spot'
+            };
+          }
+          if (d.prices.BTC_DOM) snap.prices['BTC_DOM'] = { last: d.prices.BTC_DOM.last, symbol: 'BTC_DOM' };
+        }
+        // Candles por TF
+        if (d.ohlcv) {
+          Object.keys(d.ohlcv).forEach(function(tf2) {
+            snap.btcCandles[tf2] = d.ohlcv[tf2].map(function(c) {
+              return typeof c === 'object' ? c : { ts: c[0], open: c[1], high: c[2], low: c[3], close: c[4], volume: c[5] };
+            });
+          });
+        }
+        // Macro
+        if (d.macro) {
+          snap.macro_br = { selic: d.macro.selic, ptax_compra: d.macro.ptax_compra, ptax_venda: d.macro.ptax_venda };
+        }
+        var fresh = calcBtcFreshness(snap);
+        addLog('BTC_FULL', fresh.status === 'ok' ? 'ok' : 'warn',
+          'age:' + fresh.age_s + 's lat:' + (Date.now()-t0) + 'ms partial:' + fresh.partial + ' notes:' + (fresh.notes||[]).join(','));
+        stateSet({ snapshot: snap, btcFreshness: fresh, snapshotLoading: false, _btcTimerTick: (ST._btcTimerTick||0)+1 });
+        if (ST.page === 'btc') render();
+      }).catch(function(e) {
+        // Fallback para stack atual
+        fetchBtcFallback(tf, t0);
+      });
+  } else {
+    fetchBtcFallback(tf, t0);
+  }
+}
+
+function fetchBtcFallback(tf, t0) {
+  Promise.all([fetchAllMarketData(), fetchBTCCandles(tf, 50)])
+    .then(function(r) {
+      var s = r[0];
+      if (!s.btcCandles) s.btcCandles = {};
+      s.btcCandles[tf] = r[1];
+      s.latency_ms = Date.now() - t0;
+      var fresh = calcBtcFreshness(s);
+      addLog('BTC_FULL_FALLBACK', 'ok', 'lat:' + (Date.now()-t0) + 'ms src:direct');
+      stateSet({ snapshot: s, btcFreshness: fresh, snapshotLoading: false, _btcTimerTick: (ST._btcTimerTick||0)+1 });
+      if (ST.page === 'btc') render();
+    }).catch(function() { stateSet({ snapshotLoading: false }); });
+}
+
+// Iniciar polling BTC (B1)
+function startBtcPolling() {
+  stopBtcPolling();
+  if (!ST.btcAutoRefresh) return;
+  _btcTimerFast = setInterval(function() {
+    if (ST.page !== 'btc') return;  // só pollar quando na página
+    fetchBtcTickerFast();
+  }, 10000);  // 10s — só price
+  _btcTimerFull = setInterval(function() {
+    if (ST.page !== 'btc') return;
+    fetchBtcFull();
+  }, 60000);  // 60s — completo
+}
+
+function stopBtcPolling() {
+  if (_btcTimerFast) { clearInterval(_btcTimerFast); _btcTimerFast = null; }
+  if (_btcTimerFull) { clearInterval(_btcTimerFull); _btcTimerFull = null; }
+}
+
+// Renderizar o HUD de freshness (B2)
+function renderFreshnessHUD(fresh) {
+  fresh = fresh || ST.btcFreshness;
+  var configs = {
+    ok:      { bg:'rgba(16,185,129,.1)',  border:'rgba(16,185,129,.28)',  dot:'var(--green)', label:'OK',      ageColor:'var(--green)' },
+    partial: { bg:'rgba(245,158,11,.1)', border:'rgba(245,158,11,.28)', dot:'var(--amber)', label:'PARCIAL', ageColor:'var(--amber)' },
+    stale:   { bg:'rgba(244,63,94,.1)',  border:'rgba(244,63,94,.28)',  dot:'var(--red)',   label:'STALE',   ageColor:'var(--red)' },
+    offline: { bg:'rgba(255,255,255,.04)',border:'rgba(255,255,255,.1)', dot:'var(--t3)',   label:'OFFLINE', ageColor:'var(--t3)' },
+  };
+  var status = fresh ? fresh.status : 'offline';
+  var cfg = configs[status] || configs['offline'];
+  var hud = div('');
+  hud.style.cssText = 'padding:12px 16px;border-radius:14px;margin-bottom:14px;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px;background:' + cfg.bg + ';border:1px solid ' + cfg.border;
+
+  // LEFT: fonte + status
+  var left = div(''); left.style.cssText = 'display:flex;align-items:center;gap:12px;flex-wrap:wrap';
+  var dotEl = div(''); dotEl.style.cssText = 'width:10px;height:10px;border-radius:50%;flex-shrink:0;background:' + cfg.dot + (status==='ok'?';animation:dot-pulse 2s infinite':'');
+  var srcEl = div('');
+  srcEl.style.cssText = 'display:flex;flex-direction:column;gap:2px';
+  var srcLbl = span(''); srcLbl.style.cssText='font-size:11px;font-weight:800;letter-spacing:1px;text-transform:uppercase;color:' + cfg.dot; srcLbl.textContent = '📡 ' + cfg.label + ' · Binance Spot BTCUSDT';
+  var srcSub = span(''); srcSub.style.cssText='font-size:10px;color:var(--t3)';
+  var priceTs = fresh && fresh.price_ts ? new Date(fresh.price_ts).toLocaleTimeString('pt-BR') : '—';
+  srcSub.textContent = 'Última atualização: ' + priceTs + (fresh && fresh.latency_ms ? ' · latência ' + fresh.latency_ms + 'ms' : '');
+  append(srcEl, srcLbl, srcSub);
+  append(left, dotEl, srcEl);
+
+  // Notes
+  if (fresh && fresh.notes && fresh.notes.length) {
+    var noteEl = span(''); noteEl.style.cssText='font-size:10px;color:var(--amber);padding:2px 8px;border-radius:20px;background:rgba(245,158,11,.1);border:1px solid rgba(245,158,11,.2)';
+    noteEl.textContent = fresh.notes.slice(0,3).join(' · ');
+    left.appendChild(noteEl);
+  }
+
+  // RIGHT: age counter
+  var right = div(''); right.style.cssText = 'display:flex;align-items:center;gap:14px;flex-shrink:0';
+  if (fresh && fresh.age_s != null) {
+    var ageWrap = div(''); ageWrap.style.cssText='text-align:right';
+    var ageNum = div(''); ageNum.style.cssText='font-family:"DM Mono",monospace;font-size:22px;font-weight:600;line-height:1;color:' + cfg.ageColor;
+    ageNum.textContent = fresh.age_s + 's';
+    var ageLbl = div(''); ageLbl.style.cssText='font-size:9px;color:var(--t3);text-transform:uppercase;letter-spacing:1px;font-weight:800;margin-top:2px';
+    ageLbl.textContent = 'idade do dado';
+    append(ageWrap, ageNum, ageLbl);
+    right.appendChild(ageWrap);
+  }
+  // STALE warning
+  if (status === 'stale') {
+    var staleWarn = div('');
+    staleWarn.style.cssText='font-size:11px;font-weight:700;color:var(--red);padding:5px 10px;border-radius:8px;background:rgba(244,63,94,.1);border:1px solid rgba(244,63,94,.25)';
+    staleWarn.textContent = '⚠ Dados atrasados. Atualize antes de analisar.';
+    right.appendChild(staleWarn);
+  }
+  append(hud, left, right);
+  return hud;
+}
+
+// C1: validar freshness antes de rodar pipeline
+function assertBtcFresh() {
+  var fresh = ST.btcFreshness;
+  if (!fresh) return { ok: false, reason: 'Sem dados. Atualize primeiro.' };
+  if (fresh.status === 'offline') return { ok: false, reason: 'Dados offline. Verifique conexão.' };
+  if (fresh.status === 'stale') return { ok: false, reason: 'Dados atrasados (' + fresh.age_s + 's). Atualize antes de analisar.' };
+  if (fresh.age_s != null && fresh.age_s > 60) return { ok: false, reason: 'Dado muito antigo (' + fresh.age_s + 's). Atualize.' };
+  return { ok: true };
 }
 
 // ================================================================
@@ -3473,6 +3734,54 @@ function renderAICosts() {
   }
   wrap.appendChild(ftCard);
 
+  // Data Service URL config
+  var dsCard = div('card card-blue');
+  dsCard.appendChild(div('card-title', '🌐 DATA SERVICE (BTC Real-time)'));
+  var dsDesc = p(''); dsDesc.style.cssText='font-size:12px;color:var(--t3);margin-bottom:14px;line-height:1.6';
+  dsDesc.textContent = 'Para dados BTC em tempo real (≤5s), hospede o Data Service incluso e cole a URL. Sem DS: usa Binance direto (~2–5s, sem cache).';
+  dsCard.appendChild(dsDesc);
+  var dsFg = div('fg'); dsFg.appendChild(el('label',{},'URL do Data Service'));
+  var dsInp = el('input',{class:'input',type:'url',placeholder:'https://nexus-data-service.run.app'});
+  dsInp.value = ST.btcDsUrl || '';
+  dsInp.addEventListener('input', function(e){ stateSet({btcDsUrl: e.target.value.trim()}); });
+  dsFg.appendChild(dsInp); dsCard.appendChild(dsFg);
+  var dsBtnRow = div(''); dsBtnRow.style.cssText='display:flex;gap:8px;align-items:center;margin-top:8px';
+  var dsSaveBtn = btn('btn-green','💾 Salvar URL', function(){
+    var url = dsInp.value.trim();
+    storeSetStr('cio_btc_ds_url', url);
+    stateSet({ btcDsUrl: url });
+    addLog('DS_URL_SET', 'ok', url);
+    dsBtnRow.appendChild((function(){var ok=span('');ok.style.cssText='font-size:12px;color:var(--green);margin-left:4px';ok.textContent='✓ Salvo';setTimeout(function(){try{dsBtnRow.removeChild(ok);}catch(e){}},2000);return ok;})());
+  });
+  var dsTestBtn = btn('btn-secondary','🔌 Testar', function(){
+    var url = dsInp.value.trim();
+    if (!url) { alert('Cole a URL primeiro'); return; }
+    dsTestBtn.textContent='⚙️...'; dsTestBtn.disabled=true;
+    var t0 = Date.now();
+    fetch(url.replace(/\/$/,'') + '/health')
+      .then(function(r){ return r.json(); })
+      .then(function(d){
+        var lat = Date.now()-t0;
+        dsBtnRow.appendChild((function(){var ok=span('');ok.style.cssText='font-size:12px;color:var(--green)';ok.textContent='✓ Online · v'+d.version+' · '+lat+'ms';setTimeout(function(){try{dsBtnRow.removeChild(ok);}catch(e){}},4000);return ok;})());
+        dsTestBtn.textContent='🔌 Testar'; dsTestBtn.disabled=false;
+        addLog('DS_HEALTH', 'ok', 'v'+d.version+' lat:'+lat+'ms');
+      }).catch(function(e){
+        dsBtnRow.appendChild((function(){var err=span('');err.style.cssText='font-size:12px;color:var(--red)';err.textContent='✗ Falhou: '+e.message.slice(0,50);setTimeout(function(){try{dsBtnRow.removeChild(err);}catch(e2){}},4000);return err;})());
+        dsTestBtn.textContent='🔌 Testar'; dsTestBtn.disabled=false;
+        addLog('DS_HEALTH', 'fail', e.message);
+      });
+  });
+  append(dsBtnRow, dsSaveBtn, dsTestBtn);
+  dsCard.appendChild(dsBtnRow);
+  // Status atual
+  var dsStatusRow = div('info-row'); dsStatusRow.style.marginTop='14px';
+  dsStatusRow.appendChild(span('info-label','Status atual'));
+  var dsStatusVal = span('info-val');
+  dsStatusVal.textContent = ST.btcDsUrl ? '🟢 Configurado: ' + ST.btcDsUrl.slice(0,40) : '🟡 Usando Binance direto (sem DS)';
+  dsStatusVal.style.fontSize='12px'; dsStatusRow.appendChild(dsStatusVal);
+  dsCard.appendChild(dsStatusRow);
+  wrap.appendChild(dsCard);
+
   // G2: modo pipeline
   var infoCard = div('card card-blue');
   infoCard.appendChild(div('card-title', 'CONFIGURAÇÃO ATUAL'));
@@ -3588,30 +3897,81 @@ function renderBtcDesk() {
   var btcPrice = snap && snap.prices && snap.prices['BTCUSDT'] ? snap.prices['BTCUSDT'] : null;
   var wrap = div('');
 
-  // ── DISCLAIMER TOP (spec G) ──
+  // ── DISCLAIMER TOP ──
   var disc = div('');
-  disc.style.cssText = 'background:rgba(245,158,11,.07);border:1px solid rgba(245,158,11,.15);border-radius:12px;padding:10px 16px;margin-bottom:16px;font-size:12px;color:rgba(245,158,11,.8);line-height:1.6';
+  disc.style.cssText = 'background:rgba(245,158,11,.07);border:1px solid rgba(245,158,11,.15);border-radius:12px;padding:10px 16px;margin-bottom:14px;font-size:12px;color:rgba(245,158,11,.8);line-height:1.6';
   disc.textContent = '⚠️ Conteúdo educacional. Não é recomendação individual. Cripto tem alta volatilidade. Decisões são do usuário.';
   wrap.appendChild(disc);
+
+  // ── B2: FRESHNESS HUD ──
+  var fresh = ST.btcFreshness || calcBtcFreshness(snap);
+  wrap.appendChild(renderFreshnessHUD(fresh));
+
+  // STALE banner
+  if (fresh && fresh.status === 'stale') {
+    var staleBanner = div('banner banner-err');
+    staleBanner.textContent = '⚠️ Dados atrasados (' + fresh.age_s + 's). Atualize ou verifique o Data Service antes de rodar análise.';
+    wrap.appendChild(staleBanner);
+  }
 
   // ── HEADER / TOP BAR (seção 1) ──
   var hdr = div('page-header');
   var titleSide = div('');
   titleSide.appendChild(div('page-title', '₿ BTC Trading Desk'));
-  var snapStatus = btcPrice ? '🟢 Dados ao vivo OK' : snap ? '🟡 Dados parciais' : '🔴 Offline';
-  titleSide.appendChild(div('page-sub', snapStatus + (btcPrice ? ' · BTC $' + (btcPrice.last||0).toLocaleString('en-US',{maximumFractionDigits:0}) : '') + ' · Modo swing educacional'));
+  var price4sub = btcPrice ? '$' + (btcPrice.last||0).toLocaleString('en-US',{maximumFractionDigits:0}) : '—';
+  titleSide.appendChild(div('page-sub', 'BTC ' + price4sub + ' · Swing educacional · Auto-refresh ' + (ST.btcAutoRefresh ? 'ON' : 'OFF')));
+
   var ctrlSide = div(''); ctrlSide.style.cssText = 'display:flex;gap:8px;flex-wrap:wrap;align-items:center';
-  ctrlSide.appendChild(btn('btn-secondary', '📡 Atualizar', function() {
+
+  // B1: Auto ON/OFF toggle
+  var autoBtn = el('button', {
+    class: 'btn btn-secondary' + (ST.btcAutoRefresh ? '' : ''),
+    style: { border: ST.btcAutoRefresh ? '1px solid rgba(16,185,129,.4)' : '' }
+  }, '🔄 Auto ' + (ST.btcAutoRefresh ? 'ON' : 'OFF'));
+  autoBtn.addEventListener('click', function() {
+    var now = !ST.btcAutoRefresh;
+    storeSet('cio_btc_autorefresh', now);
+    stateSet({ btcAutoRefresh: now });
+    if (now) startBtcPolling(); else stopBtcPolling();
+    render();
+  });
+  ctrlSide.appendChild(autoBtn);
+
+  // Atualizar Agora
+  ctrlSide.appendChild(btn('btn-secondary', ST.snapshotLoading ? '⚙️...' : '📡 Atualizar Agora', function() {
+    if (ST.snapshotLoading) return;
     stateSet({ snapshotLoading: true }); render();
-    Promise.all([fetchAllMarketData(), fetchBTCCandles((params.timeframes||['1h'])[0], 50)])
-      .then(function(r) { var s=r[0]; if(!s.btcCandles)s.btcCandles={}; s.btcCandles[(params.timeframes||['1h'])[0]]=r[1]; stateSet({snapshot:s,snapshotLoading:false}); render(); });
-  }));
-  ctrlSide.appendChild(btn('btn-primary', ST.btcGenerating ? '⚙️ Analisando...' : '🤖 Rodar Análise', function() {
-    if (!ST.btcGenerating) runBtcPipeline();
-  }, ST.btcGenerating));
+    fetchBtcFull();
+  }, ST.snapshotLoading));
+
+  // C1: Rodar Análise bloqueado se stale
+  var guardResult = assertBtcFresh();
+  var runDisabled = ST.btcGenerating || !guardResult.ok;
+  var runLabel = ST.btcGenerating ? '⚙️ Analisando...' : (guardResult.ok ? '🤖 Rodar Análise' : '🔒 Dados ' + (fresh ? fresh.status.toUpperCase() : 'SEM DADOS'));
+  var runAnalBtn = btn('btn-primary', runLabel, function() {
+    if (ST.btcGenerating) return;
+    var g = assertBtcFresh();
+    if (!g.ok) { alert('⚠️ ' + g.reason); return; }
+    runBtcPipeline();
+  }, runDisabled);
+  if (!guardResult.ok) {
+    runAnalBtn.title = guardResult.reason;
+    runAnalBtn.style.opacity = '0.5';
+    runAnalBtn.style.cursor  = 'not-allowed';
+  }
+  ctrlSide.appendChild(runAnalBtn);
+
   if (ST.btcBrief && !ST.btcBrief._error) {
     ctrlSide.appendChild(btn('btn-secondary', '⬇ Exportar', function() {
-      var exp = { snapshot: ST.snapshot, params: params, agents: ST.btcAgentOutputs, final: ST.btcBrief, validation: ST.btcFactChecker };
+      var exp = {
+        snapshot:   ST.snapshot,
+        params:     params,
+        freshness:  fresh,
+        agents:     ST.btcAgentOutputs,
+        final:      ST.btcBrief,
+        validation: ST.btcFactChecker,
+        exported_at:new Date().toISOString()
+      };
       var blob = new Blob([JSON.stringify(exp,null,2)],{type:'application/json'});
       var a=document.createElement('a'); a.href=URL.createObjectURL(blob);
       a.download='btc-desk-' + new Date().toISOString().slice(0,10) + '.json'; a.click();
@@ -3625,6 +3985,15 @@ function renderBtcDesk() {
     kb.textContent = '🔑 Configure sua chave Gemini para rodar análise. É gratuito!';
     kb.addEventListener('click', function(){ setState({page:'ai_key'}); });
     wrap.appendChild(kb);
+  }
+
+  // Data Service URL config (se não configurado)
+  if (!ST.btcDsUrl) {
+    var dsBanner = div('banner banner-warn');
+    dsBanner.style.cursor = 'pointer';
+    dsBanner.innerHTML = '🌐 <strong>Data Service não configurado</strong> — usando Binance direto (mais lento). Configure a URL em Pipeline & IA para dados em tempo real ≤5s.';
+    dsBanner.addEventListener('click', function(){ setState({page:'ai_costs'}); });
+    wrap.appendChild(dsBanner);
   }
 
   var grid = div('grid2');
@@ -4033,8 +4402,28 @@ function renderBtcDesk() {
     storeSet('cio_ai_cfg', nc);
   }
   addLog('BOOT', 'ok', 'Free-tier: ' + (ST.freeTierActive !== false ? 'ativo' : 'inativo') + ' | modelo: ' + ((ST.aiCfg||{}).model || GEMINI_DEFAULT));
+  // Restaurar DS URL do storage
+  var savedDsUrl = storeGetStr('cio_btc_ds_url', '');
+  if (savedDsUrl) stateSet({ btcDsUrl: savedDsUrl });
 })();
 render();
-</script>
-</body>
-</html>
+// ================================================================
+// D: WEBSOCKET PLACEHOLDER — pronto para upgrade futuro
+// Para ativar: substituir startBtcPolling() por initBtcWebSocket()
+// ================================================================
+// function initBtcWebSocket() {
+//   if (!ST.btcDsUrl) return startBtcPolling();
+//   var wsUrl = ST.btcDsUrl.replace('https://','wss://').replace('http://','ws://') + '/ws/btcusdt';
+//   var ws = new WebSocket(wsUrl);
+//   ws.onopen    = function()    { addLog('WS_BTC','ok','WebSocket conectado'); };
+//   ws.onmessage = function(ev)  { var d=JSON.parse(ev.data); /* update ticker */ fetchBtcTickerFast(); };
+//   ws.onerror   = function()    { ws.close(); startBtcPolling(); /* fallback polling */ };
+//   ws.onclose   = function()    { setTimeout(function(){ initBtcWebSocket(); }, 5000); /* reconnect */ };
+// }
+// D: WebSocket placeholder (não implementado — pronto para upgrade)
+// function initBtcWebSocket() {
+//   var ws = new WebSocket(ST.btcDsUrl.replace('https','wss') + '/ws/btcusdt');
+//   ws.onmessage = function(ev) { var d = JSON.parse(ev.data); /* update ticker */ };
+//   ws.onerror   = function()    { ws.close(); startBtcPolling(); };  // fallback para polling
+// }
+</script></body></html>
