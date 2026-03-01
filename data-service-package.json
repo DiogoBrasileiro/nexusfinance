@@ -1,13 +1,15 @@
 {
   "name": "nexus-finance-data-service",
-  "version": "1.0.0",
-  "description": "Nexus Finance BTC Data Service — Binance real-time + cache TTL",
+  "version": "2.0.0",
+  "description": "Nexus Finance Data Service — BTC real-time + Binance Account API",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
     "dev": "node --watch server.js"
   },
-  "engines": { "node": ">=18" },
+  "engines": {
+    "node": ">=18"
+  },
   "dependencies": {
     "express": "^4.18.2",
     "node-fetch": "^2.7.0",

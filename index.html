@@ -1,7 +1,8 @@
 <!DOCTYPE html>
 <html lang="pt-BR">
 <head>
-<meta charset="UTF-8"/><meta name="viewport" content="width=device-width,initial-scale=1.0,viewport-fit=cover"/>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1.0,viewport-fit=cover"/>
 <title>Nexus Finance — Mesa de Operações</title>
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>₿</text></svg>"/>
 <link rel="preconnect" href="https://fonts.googleapis.com"/>
@@ -946,7 +947,11 @@ input, select, button, textarea { font-family: 'Outfit', sans-serif; }
   .qa-icon-wrap .icon-inner { font-size: 22px; }
   .mkt-grid { grid-template-columns: 1fr 1fr; }
 }
-</style></head><body><div id="app"></div><script>// ================================================================
+</style>
+</head>
+<body>
+<div id="app"></div>
+<script>// ================================================================
 // NEXUS FINANCE v3.0 - MESA DE OPERAÇÕES
 // ================================================================
 var APP_VERSION = '3.0.0';
@@ -1050,7 +1055,17 @@ var ST = {
   btcAutoRefresh: storeGet('cio_btc_autorefresh', true),
   btcFreshness: null,         // { age_s, status, price_ts, partial, notes, latency_ms }
   btcDsUrl: storeGetStr('cio_btc_ds_url', ''),  // Data Service base URL
-  _btcTimerTick: 0            // increments to force HUD re-render
+  _btcTimerTick: 0,           // increments to force HUD re-render
+  // ── BINANCE ACCOUNT ──
+  bnCfg: storeGet('cio_bn_cfg', { apiKey:'', market:'spot', connected:false }),
+  bnAccountData: null,       // { balances, openOrders, positions }
+  bnTradeHistory: null,
+  bnLoading: false,
+  bnError: null,
+  bnTab: 'overview',         // overview | orders | trades | neworder | history
+  bnOrderForm: { symbol:'BTCUSDT', side:'BUY', type:'LIMIT', quantity:'', price:'', stopPrice:'' },
+  bnOrderConfirm: null,      // ordem pendente confirmação
+  bnOrderResult: null        // resultado da última ordem
 };
 
 function setState(partial) {
@@ -1759,6 +1774,107 @@ function buildBtcPrompt(agentId, snap, params, prev) {
   return p;
 }
 
+// ================================================================
+// BINANCE ACCOUNT API CALLER — via Data Service (HMAC server-side)
+// ================================================================
+function bnCall(method, path, body) {
+  var dsUrl = ST.btcDsUrl;
+  if (!dsUrl) return Promise.reject(new Error('Data Service não configurado. Vá em Pipeline & IA.'));
+  var cfg = ST.bnCfg || {};
+  if (!cfg.apiKey || !cfg.secret) return Promise.reject(new Error('Chaves Binance não configuradas.'));
+  var url = dsUrl.replace(/\/$/, '') + path;
+  var opts = {
+    method: method || 'GET',
+    headers: {
+      'Content-Type': 'application/json',
+      'X-Binance-ApiKey': cfg.apiKey,
+      'X-Binance-Secret': cfg.secret
+    }
+  };
+  if (body && method !== 'GET') opts.body = JSON.stringify(body);
+  return fetch(url, opts).then(function(r) {
+    return r.json().then(function(d) {
+      if (!r.ok) throw new Error(d.error || 'HTTP ' + r.status + (d.code ? ' [' + d.code + ']' : ''));
+      return d;
+    });
+  });
+}
+
+// Carregar overview completo da conta
+function loadBinanceAccount() {
+  var cfg = ST.bnCfg || {};
+  if (!cfg.apiKey || !cfg.secret || !ST.btcDsUrl) {
+    stateSet({ bnError: 'Configure chaves e Data Service primeiro.', bnLoading: false });
+    render(); return;
+  }
+  stateSet({ bnLoading: true, bnError: null }); render();
+  var market = cfg.market || 'spot';
+  var calls = market === 'futures'
+    ? [
+        bnCall('GET', '/account/futures/balances'),
+        bnCall('GET', '/account/futures/positions'),
+        bnCall('GET', '/account/futures/orders')
+      ]
+    : [
+        bnCall('GET', '/account/spot/balances'),
+        bnCall('GET', '/account/spot/orders'),
+        Promise.resolve({ data: [] })
+      ];
+  Promise.all(calls).then(function(results) {
+    var accData = {
+      market:     market,
+      balances:   results[0].data,
+      positions:  results[1].data,
+      openOrders: results[2].data,
+      ts:         new Date().toISOString()
+    };
+    addLog('BINANCE_ACCOUNT', 'ok', 'market:' + market + ' loaded');
+    setState({ bnAccountData: accData, bnLoading: false });
+  }).catch(function(e) {
+    addLog('BINANCE_ACCOUNT', 'fail', e.message);
+    setState({ bnLoading: false, bnError: e.message });
+  });
+}
+
+// Enviar ordem com confirmação prévia
+function submitBnOrder(market, orderParams) {
+  var path = '/account/' + market + '/order';
+  stateSet({ bnLoading: true }); render();
+  bnCall('POST', path, orderParams).then(function(r) {
+    addLog('BINANCE_ORDER', 'ok', orderParams.side + ' ' + orderParams.quantity + ' ' + orderParams.symbol + ' @ ' + (orderParams.price || 'MARKET'));
+    setState({ bnLoading: false, bnOrderResult: r.order, bnOrderConfirm: null, bnTab: 'orders' });
+    setTimeout(function() { loadBinanceAccount(); }, 1200);
+  }).catch(function(e) {
+    addLog('BINANCE_ORDER', 'fail', e.message);
+    setState({ bnLoading: false, bnError: e.message, bnOrderConfirm: null });
+  });
+}
+
+// Cancelar ordem
+function cancelBnOrder(market, symbol, orderId) {
+  var path = '/account/' + market + '/order?symbol=' + symbol + '&orderId=' + orderId;
+  bnCall('DELETE', path).then(function() {
+    addLog('BINANCE_CANCEL', 'ok', 'orderId:' + orderId);
+    loadBinanceAccount();
+  }).catch(function(e) {
+    addLog('BINANCE_CANCEL', 'fail', e.message);
+    setState({ bnError: e.message });
+  });
+}
+
+// Carregar histórico de trades
+function loadBnTradeHistory(symbol) {
+  symbol = symbol || 'BTCUSDT';
+  var market = (ST.bnCfg || {}).market || 'spot';
+  var path = '/account/' + market + '/trades?symbol=' + symbol + '&limit=30';
+  stateSet({ bnLoading: true }); render();
+  bnCall('GET', path).then(function(r) {
+    setState({ bnTradeHistory: r.data, bnLoading: false });
+  }).catch(function(e) {
+    setState({ bnLoading: false, bnError: e.message });
+  });
+}
+
 // C: reduzir contexto para max 1000 chars por agente (spec C)
 function buildCompactBundle(bundle) {
   var compact = {};
@@ -2328,8 +2444,11 @@ function renderSidebar() {
       { id:'opportunities',  icon:'🎯', label:'O que Fazer Agora' },
       { id:'portfolio',      icon:'💼', label:'Minha Carteira' }
     ]},
-    { title: 'Análise', items: [
+    { title: 'Trading', items: [
       { id:'btc',            icon:'₿',  label:'BTC Trading Desk' },
+      { id:'binance',        icon:'🟡', label:'Minha Conta Binance' }
+    ]},
+    { title: 'Análise', items: [
       { id:'agents',         icon:'🤖', label:'Agentes IA' },
       { id:'agent_outputs',  icon:'🧠', label:'Outputs IA' }
     ]},
@@ -2396,7 +2515,8 @@ function renderPage() {
     mercado:        renderMercado,
     opportunities:  renderOpportunities,
     portfolio:      renderPortfolio,
-    btc:            renderBtcDesk, // BTC Trading Desk
+    btc:            renderBtcDesk,
+    binance:        renderBinanceAccount,
     agents:         renderAgents,
     agent_outputs:  renderAgentOutputs,
     ai_key:         renderAIKey,
@@ -4389,6 +4509,601 @@ function renderBtcDesk() {
 }
 
 // ================================================================
+// BINANCE ACCOUNT PAGE
+// ================================================================
+function renderBinanceAccount() {
+  var cfg     = ST.bnCfg || {};
+  var accData = ST.bnAccountData;
+  var market  = cfg.market || 'spot';
+  var wrap    = div('');
+
+  // ── HEADER ──
+  var hdr = div('page-header');
+  var titleSide = div('');
+  titleSide.appendChild(div('page-title', '🟡 Minha Conta Binance'));
+  titleSide.appendChild(div('page-sub', (cfg.connected ? '🟢 Conectado · ' : '🔴 Não conectado · ') + (market === 'futures' ? 'Futures USDT-M' : 'Spot')));
+  var ctrlSide = div(''); ctrlSide.style.cssText = 'display:flex;gap:8px;flex-wrap:wrap;align-items:center';
+  if (cfg.apiKey && ST.btcDsUrl) {
+    ctrlSide.appendChild(btn('btn-secondary', ST.bnLoading ? '⚙️...' : '🔄 Atualizar', function() {
+      if (!ST.bnLoading) loadBinanceAccount();
+    }, ST.bnLoading));
+  }
+  append(hdr, titleSide, ctrlSide);
+  wrap.appendChild(hdr);
+
+  // ── AVISO SEGURANÇA ──
+  var secBanner = div('');
+  secBanner.style.cssText = 'padding:12px 18px;border-radius:12px;margin-bottom:16px;background:rgba(124,58,237,.08);border:1px solid rgba(124,58,237,.2);font-size:12px;color:rgba(180,160,255,.9);line-height:1.7';
+  secBanner.innerHTML = '🔐 <strong>Segurança:</strong> Suas chaves são armazenadas localmente no navegador e enviadas apenas ao seu Data Service (backend privado). O app NUNCA armazena suas chaves em servidores Anthropic. Use chaves com permissão de <strong>leitura + trading</strong>. <strong>Nunca ative saque (withdraw)</strong>. Recomendamos criar chaves restritas por IP no painel Binance.';
+  wrap.appendChild(secBanner);
+
+  // ── ERRO ──
+  if (ST.bnError) {
+    var errBn = div('banner banner-err');
+    errBn.textContent = '⚠️ ' + ST.bnError;
+    wrap.appendChild(errBn);
+  }
+
+  // ── CONFIGURAÇÃO (se não configurado) ──
+  if (!cfg.apiKey || !ST.btcDsUrl) {
+    wrap.appendChild(renderBinanceSetup());
+    return wrap;
+  }
+
+  // ── TABS ──
+  var tabs = div('');
+  tabs.style.cssText = 'display:flex;gap:4px;margin-bottom:20px;flex-wrap:wrap';
+  var TAB_LIST = [
+    { id:'overview', label:'📊 Visão Geral' },
+    { id:'orders',   label:'📋 Ordens Abertas' },
+    { id:'neworder', label:'➕ Nova Ordem' },
+    { id:'trades',   label:'📜 Histórico' },
+  ];
+  if (market === 'futures') TAB_LIST.splice(1, 0, { id:'positions', label:'📌 Posições' });
+  TAB_LIST.forEach(function(t) {
+    var tb = el('button', {
+      class: 'filter-btn' + (ST.bnTab === t.id ? ' on' : ''),
+      onclick: function() { stateSet({ bnTab: t.id }); if (t.id === 'trades' && !ST.bnTradeHistory) loadBnTradeHistory('BTCUSDT'); render(); }
+    }, t.label);
+    tabs.appendChild(tb);
+  });
+  wrap.appendChild(tabs);
+
+  // ── LOADING ──
+  if (ST.bnLoading && !accData) {
+    var sw = div('spinner-wrap'); sw.appendChild(div('spinner'));
+    var lt = p(''); lt.style.cssText='font-size:14px;color:var(--t2);text-align:center;margin-top:12px';
+    lt.textContent = 'Conectando à Binance...';
+    sw.appendChild(lt); wrap.appendChild(sw); return wrap;
+  }
+
+  // ── SEM DADOS: botão carregar ──
+  if (!accData) {
+    var emptyAcc = div('card col2');
+    emptyAcc.innerHTML = '<div class="empty-icon">🟡</div><div class="empty-title">Conta não carregada</div><div class="empty-sub">Clique abaixo para conectar e carregar seu saldo e ordens.</div>';
+    var loadBtn = btn('btn-primary', '🔗 Carregar Conta Agora', function() { loadBinanceAccount(); });
+    loadBtn.style.marginTop = '16px';
+    emptyAcc.appendChild(loadBtn);
+    wrap.appendChild(emptyAcc);
+    return wrap;
+  }
+
+  // ══════════════════════════════════════════════
+  // TAB: OVERVIEW
+  // ══════════════════════════════════════════════
+  if (ST.bnTab === 'overview') {
+    var grid = div('grid2');
+    var balances = accData.balances || {};
+    var isFutures = (market === 'futures');
+
+    if (isFutures) {
+      // Futures overview card
+      var futCard = div('card card-violet col2');
+      futCard.appendChild(div('card-title', '📊 RESUMO FUTURES USDT-M'));
+      var futMetrics = [
+        ['Saldo Total (wallet)', '$' + (balances.totalWalletBalance||0).toFixed(2) + ' USDT'],
+        ['PnL Não Realizado',    (balances.totalUnrealizedProfit >= 0 ? '+' : '') + (balances.totalUnrealizedProfit||0).toFixed(2) + ' USDT'],
+        ['Margem Disponível',   '$' + (balances.availableBalance||0).toFixed(2) + ' USDT'],
+        ['Margem em Uso',        '$' + (balances.totalPositionInitialMargin||0).toFixed(2) + ' USDT'],
+      ];
+      var pnlColor = (balances.totalUnrealizedProfit||0) >= 0 ? 'var(--green)' : 'var(--red)';
+      futMetrics.forEach(function(row, i) {
+        var r = div('info-row');
+        r.appendChild(span('info-label', row[0]));
+        var v = span('info-val'); v.textContent = row[1];
+        if (i === 1) v.style.color = pnlColor;
+        r.appendChild(v); futCard.appendChild(r);
+      });
+      grid.appendChild(futCard);
+
+      // Assets futures
+      if (balances.assets && balances.assets.length) {
+        var assCard = div('card card-blue');
+        assCard.appendChild(div('card-title', '💰 ATIVOS FUTURES'));
+        var tbl = el('table',{class:'data-table'});
+        var th = el('thead',{},el('tr',{},[el('th',{},'ATIVO'),el('th',{style:{textAlign:'right'}},'WALLET'),el('th',{style:{textAlign:'right'}},'PNL NÃO REAL.'),el('th',{style:{textAlign:'right'}},'DISPONÍVEL')]));
+        var tb2 = el('tbody');
+        balances.assets.forEach(function(a) {
+          var pnlC = a.unrealizedProfit >= 0 ? 'var(--green)' : 'var(--red)';
+          var tr = el('tr');
+          tr.appendChild(el('td',{style:{fontWeight:'700'}}, a.asset));
+          tr.appendChild(el('td',{style:{textAlign:'right',fontFamily:'DM Mono,monospace',fontSize:'13px'}}, a.walletBalance.toFixed(4)));
+          tr.appendChild(el('td',{style:{textAlign:'right',fontFamily:'DM Mono,monospace',fontSize:'13px',color:pnlC}}, (a.unrealizedProfit>=0?'+':'') + a.unrealizedProfit.toFixed(4)));
+          tr.appendChild(el('td',{style:{textAlign:'right',fontFamily:'DM Mono,monospace',fontSize:'13px'}}, a.availableBalance.toFixed(4)));
+          tb2.appendChild(tr);
+        });
+        append(tbl, th, tb2); assCard.appendChild(tbl);
+        grid.appendChild(assCard);
+      }
+    } else {
+      // Spot balances
+      var spotCard = div('card card-blue col2');
+      spotCard.appendChild(div('card-title', '💰 SALDO SPOT'));
+      // Linha de permissões
+      var permRow = div(''); permRow.style.cssText='display:flex;gap:8px;flex-wrap:wrap;margin-bottom:16px';
+      [['canTrade','⚡ Trading'],['canWithdraw','💸 Saque'],['canDeposit','📥 Depósito']].forEach(function(item) {
+        var badge = span('');
+        badge.style.cssText = 'font-size:11px;padding:3px 10px;border-radius:20px;font-weight:700;background:' +
+          (balances[item[0]] ? 'rgba(16,185,129,.15);color:var(--green);border:1px solid rgba(16,185,129,.3)' : 'rgba(244,63,94,.1);color:var(--red);border:1px solid rgba(244,63,94,.2)');
+        badge.textContent = (balances[item[0]] ? '✓ ' : '✗ ') + item[1];
+        permRow.appendChild(badge);
+      });
+      spotCard.appendChild(permRow);
+      // Tabela de saldos
+      var spTbl = el('table',{class:'data-table'});
+      var spTh = el('thead',{},el('tr',{},[el('th',{},'ATIVO'),el('th',{style:{textAlign:'right'}},'LIVRE'),el('th',{style:{textAlign:'right'}},'BLOQUEADO'),el('th',{style:{textAlign:'right'}},'TOTAL')]));
+      var spTb = el('tbody');
+      var bals = balances.balances || [];
+      if (bals.length === 0) {
+        spTb.appendChild(el('tr',{},el('td',{colspan:'4',style:{textAlign:'center',padding:'30px',color:'var(--t3)'}},'Nenhum saldo encontrado.')));
+      }
+      bals.slice(0, 20).forEach(function(b) {
+        var tr = el('tr');
+        var assetBadge = span(''); assetBadge.style.cssText='font-weight:800;font-size:13px;color:var(--amber)';
+        assetBadge.textContent = b.asset;
+        tr.appendChild(el('td',{}, assetBadge));
+        [b.free.toFixed(6), b.locked.toFixed(6), b.total.toFixed(6)].forEach(function(v) {
+          tr.appendChild(el('td',{style:{textAlign:'right',fontFamily:'DM Mono,monospace',fontSize:'12px'}}, v));
+        });
+        spTb.appendChild(tr);
+      });
+      append(spTbl, spTh, spTb); spotCard.appendChild(spTbl);
+      if (bals.length > 20) {
+        var more = p(''); more.style.cssText='font-size:11px;color:var(--t3);text-align:center;padding-top:8px';
+        more.textContent = '... e mais ' + (bals.length-20) + ' ativos';
+        spotCard.appendChild(more);
+      }
+      grid.appendChild(spotCard);
+    }
+
+    // Ordens abertas mini (no overview)
+    var openOrd = accData.openOrders || [];
+    var ordMini = div('card card-gold');
+    ordMini.appendChild(div('card-title', '📋 ORDENS ABERTAS (' + openOrd.length + ')'));
+    if (openOrd.length === 0) {
+      var noOrd = p(''); noOrd.style.cssText='color:var(--t3);font-size:13px;padding:10px 0;text-align:center';
+      noOrd.textContent = 'Nenhuma ordem aberta';
+      ordMini.appendChild(noOrd);
+    } else {
+      openOrd.slice(0, 5).forEach(function(o) {
+        var oRow = div('');
+        oRow.style.cssText = 'padding:10px 0;border-bottom:1px solid rgba(255,255,255,.05);display:flex;justify-content:space-between;align-items:center;gap:8px';
+        var oLeft = div('');
+        var oBadge = span(''); oBadge.style.cssText='font-size:11px;padding:2px 8px;border-radius:4px;font-weight:800;margin-right:6px;background:' + (o.side==='BUY'?'rgba(16,185,129,.15);color:var(--green)':'rgba(244,63,94,.12);color:var(--red)');
+        oBadge.textContent = o.side;
+        var oSym = span(''); oSym.style.cssText='font-size:13px;font-weight:700;color:var(--t1)'; oSym.textContent = o.symbol;
+        var oType = span(''); oType.style.cssText='font-size:11px;color:var(--t3);margin-left:6px'; oType.textContent = o.type;
+        append(oLeft, oBadge, oSym, oType);
+        var oRight = div(''); oRight.style.cssText='text-align:right';
+        var oPrice = p(''); oPrice.style.cssText='font-family:DM Mono,monospace;font-size:12px;color:var(--t1)';
+        oPrice.textContent = '$' + (o.price||0).toLocaleString('en-US',{maximumFractionDigits:2});
+        var oQty = p(''); oQty.style.cssText='font-size:11px;color:var(--t3)'; oQty.textContent = 'Qtd: ' + o.origQty;
+        append(oRight, oPrice, oQty);
+        append(oRow, oLeft, oRight); ordMini.appendChild(oRow);
+      });
+    }
+    var newOrdBtn = btn('btn-primary','➕ Nova Ordem', function(){ stateSet({bnTab:'neworder'}); render(); });
+    newOrdBtn.style.marginTop = '12px';
+    ordMini.appendChild(newOrdBtn);
+    grid.appendChild(ordMini);
+
+    // Última atualização
+    var tsCard = div('');
+    tsCard.style.cssText = 'col-span:2;text-align:center;font-size:11px;color:var(--t3);padding:8px;margin-top:4px';
+    tsCard.textContent = 'Última atualização: ' + new Date(accData.ts).toLocaleTimeString('pt-BR') + ' · ' + (isFutures ? 'Futures USDT-M' : 'Spot');
+    grid.appendChild(tsCard);
+    wrap.appendChild(grid);
+  }
+
+  // ══════════════════════════════════════════════
+  // TAB: POSIÇÕES FUTURES
+  // ══════════════════════════════════════════════
+  if (ST.bnTab === 'positions' && market === 'futures') {
+    var positions = accData.positions || [];
+    var posCard = div('card card-violet');
+    posCard.appendChild(div('card-title', '📌 POSIÇÕES ABERTAS FUTURES'));
+    if (positions.length === 0) {
+      var noPosEl = div('empty-state'); noPosEl.style.padding='40px 0';
+      noPosEl.innerHTML = '<div class="empty-icon">📌</div><div class="empty-title">Sem posições abertas</div>';
+      posCard.appendChild(noPosEl);
+    } else {
+      positions.forEach(function(p2) {
+        var isLong = p2.positionAmt > 0;
+        var pnlPos = parseFloat(p2.unrealizedProfit);
+        var pnlColor = pnlPos >= 0 ? 'var(--green)' : 'var(--red)';
+        var posBox = div('');
+        posBox.style.cssText = 'padding:16px;margin-bottom:12px;border-radius:14px;background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.08)';
+        var posTop = div(''); posTop.style.cssText='display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:12px';
+        var posName = div('');
+        var posSymBadge = span(''); posSymBadge.style.cssText='font-size:15px;font-weight:800;color:var(--amber)'; posSymBadge.textContent = p2.symbol;
+        var posSideBadge = span(''); posSideBadge.style.cssText='font-size:11px;padding:2px 8px;border-radius:4px;font-weight:800;margin-left:8px;background:' + (isLong?'rgba(16,185,129,.15);color:var(--green)':'rgba(244,63,94,.12);color:var(--red)');
+        posSideBadge.textContent = isLong ? 'LONG' : 'SHORT';
+        var posLev = span(''); posLev.style.cssText='font-size:11px;color:var(--t3);margin-left:6px'; posLev.textContent = p2.leverage + 'x';
+        append(posName, posSymBadge, posSideBadge, posLev);
+        var posPnl = div('');
+        var pnlNum = div(''); pnlNum.style.cssText='font-family:DM Mono,monospace;font-size:20px;font-weight:700;color:' + pnlColor;
+        pnlNum.textContent = (pnlPos>=0?'+':'') + pnlPos.toFixed(4) + ' USDT';
+        var pnlPct = div(''); pnlPct.style.cssText='font-size:12px;color:' + pnlColor + ';text-align:right';
+        pnlPct.textContent = (p2.pnlPct>0?'+':'') + p2.pnlPct + '%';
+        append(posPnl, pnlNum, pnlPct);
+        append(posTop, posName, posPnl);
+        posBox.appendChild(posTop);
+        var posDetails = div('thermo-grid');
+        [['Quantidade', p2.positionAmt],['Preço de Entrada','$'+p2.entryPrice.toLocaleString('en-US',{maximumFractionDigits:2})],
+         ['Mark Price','$'+p2.markPrice.toLocaleString('en-US',{maximumFractionDigits:2})],
+         ['Liquidação', p2.liquidationPrice > 0 ? '$'+p2.liquidationPrice.toLocaleString('en-US',{maximumFractionDigits:2}) : '—'],
+         ['Margem','$'+p2.marginType],['Modo',p2.positionSide]].forEach(function(row) {
+           var c = div('thermo-item'); c.appendChild(div('thermo-lbl',row[0]));
+           var v = div('thermo-val'); v.textContent = row[1]; c.appendChild(v); posDetails.appendChild(c);
+        });
+        posBox.appendChild(posDetails);
+        posCard.appendChild(posBox);
+      });
+    }
+    wrap.appendChild(posCard);
+  }
+
+  // ══════════════════════════════════════════════
+  // TAB: ORDENS ABERTAS
+  // ══════════════════════════════════════════════
+  if (ST.bnTab === 'orders') {
+    var openOrders = accData.openOrders || [];
+    var ordCard = div('card card-blue');
+    ordCard.appendChild(div('card-title', '📋 ORDENS ABERTAS (' + openOrders.length + ')'));
+    if (openOrders.length === 0) {
+      var noOrdEl = div('empty-state'); noOrdEl.style.padding='40px 0';
+      noOrdEl.innerHTML = '<div class="empty-icon">📋</div><div class="empty-title">Nenhuma ordem aberta</div><div class="empty-sub">Suas ordens ativas aparecerão aqui.</div>';
+      ordCard.appendChild(noOrdEl);
+    } else {
+      var ordTbl = el('table',{class:'data-table'});
+      var ordTh = el('thead',{},el('tr',{},[
+        el('th',{},'PAR'),el('th',{},'LADO'),el('th',{},'TIPO'),
+        el('th',{style:{textAlign:'right'}},'PREÇO'),el('th',{style:{textAlign:'right'}},'QTD ORIG'),
+        el('th',{style:{textAlign:'right'}},'QTD EXEC'),el('th',{},'STATUS'),el('th',{},'AÇÃO')
+      ]));
+      var ordTb = el('tbody');
+      openOrders.forEach(function(o) {
+        var tr = el('tr');
+        var sideBadge = span(''); sideBadge.style.cssText='font-size:10px;padding:2px 7px;border-radius:4px;font-weight:800;background:' + (o.side==='BUY'?'rgba(16,185,129,.15);color:var(--green)':'rgba(244,63,94,.12);color:var(--red)');
+        sideBadge.textContent = o.side;
+        var cancelBtn = el('button',{
+          class:'btn btn-secondary',
+          style:{fontSize:'11px',padding:'3px 10px'},
+          onclick: function(){ if (confirm('Cancelar ordem ' + o.orderId + '?')) cancelBnOrder(market, o.symbol, o.orderId); }
+        }, '✕ Cancelar');
+        tr.appendChild(el('td',{style:{fontWeight:'700',color:'var(--amber)'}}, o.symbol));
+        tr.appendChild(el('td',{}, sideBadge));
+        tr.appendChild(el('td',{style:{fontSize:'12px',color:'var(--t2)'}}, o.type));
+        tr.appendChild(el('td',{style:{textAlign:'right',fontFamily:'DM Mono,monospace',fontSize:'12px'}}, '$' + (o.price||0).toLocaleString('en-US',{maximumFractionDigits:2})));
+        tr.appendChild(el('td',{style:{textAlign:'right',fontFamily:'DM Mono,monospace',fontSize:'12px'}}, o.origQty));
+        tr.appendChild(el('td',{style:{textAlign:'right',fontFamily:'DM Mono,monospace',fontSize:'12px',color:'var(--t3)'}}, o.executedQty));
+        tr.appendChild(el('td',{style:{fontSize:'11px',color:'var(--t2)'}}, o.status));
+        tr.appendChild(el('td',{}, cancelBtn));
+        ordTb.appendChild(tr);
+      });
+      append(ordTbl, ordTh, ordTb); ordCard.appendChild(ordTbl);
+    }
+    wrap.appendChild(ordCard);
+  }
+
+  // ══════════════════════════════════════════════
+  // TAB: NOVA ORDEM (com confirmação)
+  // ══════════════════════════════════════════════
+  if (ST.bnTab === 'neworder') {
+    if (ST.bnOrderConfirm) {
+      wrap.appendChild(renderBnOrderConfirmModal(ST.bnOrderConfirm, market));
+      return wrap;
+    }
+    wrap.appendChild(renderBnNewOrderForm(market));
+  }
+
+  // ══════════════════════════════════════════════
+  // TAB: HISTÓRICO DE TRADES
+  // ══════════════════════════════════════════════
+  if (ST.bnTab === 'trades') {
+    var trades = ST.bnTradeHistory || [];
+    var histCard = div('card card-blue');
+    histCard.appendChild(div('card-title', '📜 HISTÓRICO DE TRADES'));
+    // Symbol selector
+    var symRow = div(''); symRow.style.cssText='display:flex;gap:8px;margin-bottom:16px;align-items:center';
+    var symInp = el('input',{class:'input',type:'text',value:'BTCUSDT',placeholder:'BTCUSDT'}); symInp.style.maxWidth='140px';
+    var fetchTrBtn = btn('btn-secondary', '🔍 Buscar', function() { loadBnTradeHistory(symInp.value || 'BTCUSDT'); });
+    append(symRow, el('label',{},'Par:'), symInp, fetchTrBtn);
+    histCard.appendChild(symRow);
+    if (ST.bnLoading) {
+      var ldEl = p(''); ldEl.style.cssText='text-align:center;padding:24px;color:var(--t3)'; ldEl.textContent='Carregando...';
+      histCard.appendChild(ldEl);
+    } else if (!trades.length) {
+      var noTrEl = div('empty-state'); noTrEl.style.padding='30px 0';
+      noTrEl.innerHTML = '<div class="empty-icon">📜</div><div class="empty-title">Nenhum trade encontrado</div>';
+      histCard.appendChild(noTrEl);
+    } else {
+      var trTbl = el('table',{class:'data-table'});
+      var trTh = el('thead',{},el('tr',{},[
+        el('th',{},'DATA'),el('th',{},'PAR'),el('th',{},'LADO'),
+        el('th',{style:{textAlign:'right'}},'PREÇO'),el('th',{style:{textAlign:'right'}},'QTD'),
+        el('th',{style:{textAlign:'right'}},'TOTAL'),
+        market==='futures' ? el('th',{style:{textAlign:'right'}},'PNL REAL.') : el('th',{style:{textAlign:'right'}},'TAXA')
+      ]));
+      var trTb = el('tbody');
+      trades.forEach(function(t) {
+        var isBuy = t.side === 'BUY';
+        var sideSpan = span(''); sideSpan.style.cssText='font-size:10px;padding:2px 7px;border-radius:4px;font-weight:800;background:' + (isBuy?'rgba(16,185,129,.15);color:var(--green)':'rgba(244,63,94,.12);color:var(--red)');
+        sideSpan.textContent = t.side;
+        var tr2 = el('tr');
+        tr2.appendChild(el('td',{style:{fontSize:'11px',color:'var(--t3)'}}, new Date(t.time).toLocaleDateString('pt-BR',{day:'2-digit',month:'2-digit',hour:'2-digit',minute:'2-digit'})));
+        tr2.appendChild(el('td',{style:{fontWeight:'700',color:'var(--amber)',fontSize:'12px'}}, t.symbol));
+        tr2.appendChild(el('td',{}, sideSpan));
+        tr2.appendChild(el('td',{style:{textAlign:'right',fontFamily:'DM Mono,monospace',fontSize:'12px'}}, '$'+t.price.toLocaleString('en-US',{maximumFractionDigits:2})));
+        tr2.appendChild(el('td',{style:{textAlign:'right',fontFamily:'DM Mono,monospace',fontSize:'12px'}}, t.qty));
+        tr2.appendChild(el('td',{style:{textAlign:'right',fontFamily:'DM Mono,monospace',fontSize:'12px'}}, '$'+(t.quoteQty||0).toLocaleString('en-US',{maximumFractionDigits:2})));
+        var lastCol;
+        if (market === 'futures') {
+          var pnlR = t.realizedPnl || 0;
+          lastCol = el('td',{style:{textAlign:'right',fontFamily:'DM Mono,monospace',fontSize:'12px',color:pnlR>=0?'var(--green)':'var(--red)',fontWeight:'700'}}, (pnlR>=0?'+':'') + pnlR.toFixed(4));
+        } else {
+          lastCol = el('td',{style:{textAlign:'right',fontFamily:'DM Mono,monospace',fontSize:'11px',color:'var(--t3)'}}, t.commission.toFixed(6) + ' ' + t.commAsset);
+        }
+        tr2.appendChild(lastCol);
+        trTb.appendChild(tr2);
+      });
+      append(trTbl, trTh, trTb); histCard.appendChild(trTbl);
+    }
+    wrap.appendChild(histCard);
+  }
+
+  // ── Resultado da última ordem ──
+  if (ST.bnOrderResult) {
+    var resCard = div('card card-green');
+    resCard.appendChild(div('card-title', '✅ ORDEM ENVIADA COM SUCESSO'));
+    var res = ST.bnOrderResult;
+    [['Order ID', res.orderId],['Par', res.symbol],['Lado', res.side],['Tipo', res.type],
+     ['Status', res.status],['Preço', '$'+(res.price||0).toLocaleString('en-US',{maximumFractionDigits:2})],
+     ['Qtd Original', res.origQty],['Qtd Executada', res.executedQty]].forEach(function(row) {
+      var r = div('info-row'); r.appendChild(span('info-label',row[0])); r.appendChild(span('info-val',String(row[1]))); resCard.appendChild(r);
+    });
+    var clearResBtn = btn('btn-secondary','✕ Fechar', function(){ stateSet({bnOrderResult:null}); render(); });
+    clearResBtn.style.marginTop='12px'; resCard.appendChild(clearResBtn);
+    wrap.appendChild(resCard);
+  }
+
+  return wrap;
+}
+
+// ── Setup page (antes de configurar chaves) ──
+function renderBinanceSetup() {
+  var wrap = div('');
+  var cfg = ST.bnCfg || {};
+  var setupCard = div('card card-violet');
+  setupCard.appendChild(div('card-title', '🔑 CONFIGURAR CONTA BINANCE'));
+  var note = p(''); note.style.cssText='font-size:13px;color:var(--t2);margin-bottom:20px;line-height:1.7';
+  note.textContent = 'Para conectar sua conta, você precisa de: (1) Data Service configurado em Pipeline & IA, e (2) suas API Keys da Binance abaixo.';
+  setupCard.appendChild(note);
+
+  if (!ST.btcDsUrl) {
+    var noDsWarn = div('banner banner-err'); noDsWarn.style.cursor='pointer';
+    noDsWarn.textContent = '⚠️ Data Service não configurado. Clique aqui para configurar em Pipeline & IA.';
+    noDsWarn.addEventListener('click', function(){ setState({page:'ai_costs'}); });
+    setupCard.appendChild(noDsWarn);
+  }
+
+  var fields = [
+    { label:'API Key', key:'apiKey', type:'text',     ph:'Cole sua Binance API Key' },
+    { label:'Secret Key', key:'secret', type:'password', ph:'Cole sua Binance Secret Key' },
+  ];
+  fields.forEach(function(f) {
+    var fg = div('fg');
+    fg.appendChild(el('label',{},f.label));
+    var inp = el('input',{class:'input',type:f.type,placeholder:f.ph});
+    inp.value = cfg[f.key] || '';
+    inp.addEventListener('input', function(e) { cfg[f.key] = e.target.value.trim(); });
+    fg.appendChild(inp); setupCard.appendChild(fg);
+  });
+
+  // Market selector
+  var mktFg = div('fg'); mktFg.appendChild(el('label',{},'Mercado principal'));
+  var mktRow = div('profile-row');
+  [['spot','🔵 Spot'],['futures','🟡 Futures']].forEach(function(m) {
+    var mb = el('button',{
+      class:'pbtn' + (cfg.market===m[0]?' on':''),
+      onclick: function(){ cfg.market = m[0]; storeSet('cio_bn_cfg', cfg); render(); }
+    }, m[1]);
+    mktRow.appendChild(mb);
+  });
+  mktFg.appendChild(mktRow); setupCard.appendChild(mktFg);
+
+  var secNote = div('');
+  secNote.style.cssText = 'padding:12px 16px;border-radius:10px;background:rgba(244,63,94,.06);border:1px solid rgba(244,63,94,.15);font-size:12px;color:rgba(244,63,94,.8);margin-top:8px;margin-bottom:16px;line-height:1.7';
+  secNote.innerHTML = '🔐 <strong>Segurança:</strong> Suas chaves são salvas somente no <em>localStorage</em> do seu navegador e enviadas apenas ao seu Data Service privado. <strong>Nunca ative permissão de saque (withdrawal)</strong> nas chaves da API.';
+  setupCard.appendChild(secNote);
+
+  var saveBtn = btn('btn-primary', '💾 Salvar e Conectar', function() {
+    if (!cfg.apiKey || !cfg.secret) { alert('Preencha API Key e Secret Key'); return; }
+    cfg.connected = true;
+    storeSet('cio_bn_cfg', cfg);
+    stateSet({ bnCfg: cfg });
+    loadBinanceAccount();
+  });
+  setupCard.appendChild(saveBtn);
+  wrap.appendChild(setupCard);
+  return wrap;
+}
+
+// ── Formulário Nova Ordem ──
+function renderBnNewOrderForm(market) {
+  var form = ST.bnOrderForm || { symbol:'BTCUSDT', side:'BUY', type:'LIMIT', quantity:'', price:'', stopPrice:'' };
+  var btcPrice = ST.snapshot && ST.snapshot.prices && ST.snapshot.prices['BTCUSDT'] ? ST.snapshot.prices['BTCUSDT'].last : null;
+  var wrap = div('');
+
+  // Disclaimer obrigatório
+  var disc = div('');
+  disc.style.cssText = 'padding:14px 18px;border-radius:12px;margin-bottom:18px;background:rgba(244,63,94,.07);border:1px solid rgba(244,63,94,.2);font-size:12px;color:rgba(244,63,94,.9);line-height:1.7';
+  disc.innerHTML = '⚠️ <strong>Atenção:</strong> Esta ordem será enviada à sua conta Binance real. Verifique todos os valores com cuidado. A ordem é de responsabilidade exclusiva do usuário. Nenhuma garantia de execução ou resultado. Conteúdo educacional.';
+  wrap.appendChild(disc);
+
+  var formCard = div('card card-gold');
+  formCard.appendChild(div('card-title', '➕ NOVA ORDEM ' + market.toUpperCase()));
+
+  // Preço atual BTC como referência
+  if (btcPrice) {
+    var priceRef = div(''); priceRef.style.cssText='padding:10px 14px;background:rgba(0,212,255,.07);border:1px solid rgba(0,212,255,.12);border-radius:10px;margin-bottom:16px;font-size:13px;color:var(--cyan)';
+    priceRef.textContent = '📡 BTC atual: $' + btcPrice.toLocaleString('en-US',{maximumFractionDigits:2});
+    formCard.appendChild(priceRef);
+  }
+
+  // Symbol
+  var symFg = div('fg'); symFg.appendChild(el('label',{},'Par'));
+  var symInp = el('input',{class:'input',type:'text',value:form.symbol||'BTCUSDT'});
+  symInp.addEventListener('input', function(e){ form.symbol = e.target.value.toUpperCase().trim(); });
+  symFg.appendChild(symInp); formCard.appendChild(symFg);
+
+  // Side (BUY/SELL)
+  var sideFg = div('fg'); sideFg.appendChild(el('label',{},'Lado'));
+  var sideRow = div(''); sideRow.style.cssText='display:flex;gap:8px';
+  ['BUY','SELL'].forEach(function(s) {
+    var sb = el('button',{
+      class:'filter-btn' + (form.side===s?' on':''),
+      style:{flex:'1',padding:'10px',fontSize:'14px',fontWeight:'800',color:s==='BUY'?'var(--green)':'var(--red)'},
+      onclick: function(){ form.side=s; stateSet({bnOrderForm:form}); render(); }
+    }, s === 'BUY' ? '🟢 COMPRAR' : '🔴 VENDER');
+    sideRow.appendChild(sb);
+  });
+  sideFg.appendChild(sideRow); formCard.appendChild(sideFg);
+
+  // Type
+  var typeFg = div('fg'); typeFg.appendChild(el('label',{},'Tipo de Ordem'));
+  var typeRow = div(''); typeRow.style.cssText='display:flex;gap:6px;flex-wrap:wrap';
+  ['MARKET','LIMIT','STOP_LOSS_LIMIT'].forEach(function(t) {
+    var tb = el('button',{
+      class:'filter-btn' + (form.type===t?' on':''),
+      onclick: function(){ form.type=t; stateSet({bnOrderForm:form}); render(); }
+    }, t);
+    typeRow.appendChild(tb);
+  });
+  typeFg.appendChild(typeRow); formCard.appendChild(typeFg);
+
+  // Quantity
+  var qtyFg = div('fg'); qtyFg.appendChild(el('label',{},'Quantidade (ex: 0.001 BTC)'));
+  var qtyInp = el('input',{class:'input',type:'number',placeholder:'0.001',step:'0.0001',value:form.quantity||''});
+  qtyInp.addEventListener('input', function(e){ form.quantity = e.target.value; });
+  qtyFg.appendChild(qtyInp); formCard.appendChild(qtyFg);
+
+  // Price (se LIMIT ou STOP_LOSS)
+  if (form.type !== 'MARKET') {
+    var priceFg = div('fg'); priceFg.appendChild(el('label',{},'Preço Limite ($)'));
+    var priceInp = el('input',{class:'input',type:'number',placeholder: btcPrice ? String(Math.round(btcPrice)) : '50000',step:'1',value:form.price||''});
+    priceInp.addEventListener('input', function(e){ form.price = e.target.value; });
+    priceFg.appendChild(priceInp); formCard.appendChild(priceFg);
+  }
+  if (form.type === 'STOP_LOSS_LIMIT') {
+    var stopFg = div('fg'); stopFg.appendChild(el('label',{},'Stop Price ($)'));
+    var stopInp = el('input',{class:'input',type:'number',placeholder:'Ex: 44000',step:'1',value:form.stopPrice||''});
+    stopInp.addEventListener('input', function(e){ form.stopPrice = e.target.value; });
+    stopFg.appendChild(stopInp); formCard.appendChild(stopFg);
+  }
+
+  // Preview valor total
+  if (form.quantity && btcPrice) {
+    var qty = parseFloat(form.quantity);
+    var px = form.type === 'MARKET' ? btcPrice : (parseFloat(form.price) || btcPrice);
+    var total = qty * px;
+    var prev = div(''); prev.style.cssText='padding:10px 14px;background:rgba(255,255,255,.04);border-radius:10px;margin-bottom:8px;font-size:13px;color:var(--t2)';
+    prev.innerHTML = '💰 Valor aproximado: <strong style="color:var(--t1);font-family:DM Mono,monospace">$' + total.toLocaleString('en-US',{maximumFractionDigits:2}) + '</strong>';
+    formCard.appendChild(prev);
+  }
+
+  // Botão CONFIRMAR
+  var confirmBtn = btn('btn-primary', form.side==='BUY' ? '🟢 Confirmar Compra' : '🔴 Confirmar Venda', function() {
+    if (!form.quantity || parseFloat(form.quantity) <= 0) { alert('Insira uma quantidade válida'); return; }
+    if (form.type !== 'MARKET' && (!form.price || parseFloat(form.price) <= 0)) { alert('Insira um preço válido'); return; }
+    stateSet({
+      bnOrderConfirm: {
+        symbol:    form.symbol || 'BTCUSDT',
+        side:      form.side,
+        type:      form.type,
+        quantity:  form.quantity,
+        price:     form.price,
+        stopPrice: form.stopPrice,
+        totalEst:  form.quantity && btcPrice ? (parseFloat(form.quantity) * (parseFloat(form.price)||btcPrice)).toFixed(2) : '—'
+      }
+    }); render();
+  });
+  confirmBtn.style.marginTop='8px';
+  formCard.appendChild(confirmBtn);
+  wrap.appendChild(formCard);
+  return wrap;
+}
+
+// ── Modal de confirmação da ordem ──
+function renderBnOrderConfirmModal(order, market) {
+  var overlay = div('');
+  overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:1000;display:flex;align-items:center;justify-content:center;padding:20px';
+  var modal = div('card');
+  modal.style.cssText = 'max-width:440px;width:100%;background:#0d1220;border:2px solid ' + (order.side==='BUY'?'rgba(16,185,129,.4)':'rgba(244,63,94,.4)') + ';border-radius:22px;padding:28px;';
+
+  var title = div(''); title.style.cssText='font-size:18px;font-weight:900;margin-bottom:6px;color:' + (order.side==='BUY'?'var(--green)':'var(--red)');
+  title.textContent = (order.side==='BUY' ? '🟢 CONFIRMAR COMPRA' : '🔴 CONFIRMAR VENDA') + ' — ' + order.symbol;
+  modal.appendChild(title);
+
+  var warningEl = div(''); warningEl.style.cssText='font-size:12px;color:rgba(245,158,11,.8);margin-bottom:18px;padding:8px 12px;background:rgba(245,158,11,.07);border-radius:8px';
+  warningEl.textContent = '⚠️ Esta é uma ordem REAL na sua conta Binance. Revise com cuidado.';
+  modal.appendChild(warningEl);
+
+  [['Par', order.symbol],['Lado', order.side],['Tipo', order.type],['Quantidade', order.quantity + ' ' + order.symbol.replace('USDT','').replace('BTC','BTC')],
+   order.type!=='MARKET'?['Preço Limite','$' + parseFloat(order.price).toLocaleString('en-US',{maximumFractionDigits:2})]:null,
+   order.stopPrice?['Stop Price','$'+parseFloat(order.stopPrice).toLocaleString('en-US',{maximumFractionDigits:2})]:null,
+   ['Valor Estimado','~$' + order.totalEst]].filter(Boolean).forEach(function(row) {
+    var r = div('info-row');
+    var lbl = span('info-label'); lbl.textContent = row[0]; r.appendChild(lbl);
+    var v = span('info-val'); v.textContent = row[1];
+    if (row[0]==='Lado') v.style.color = order.side==='BUY'?'var(--green)':'var(--red)';
+    r.appendChild(v); modal.appendChild(r);
+  });
+
+  var btnRow = div(''); btnRow.style.cssText='display:flex;gap:10px;margin-top:20px';
+  var cancelConfBtn = btn('btn-secondary','✕ Cancelar', function(){ stateSet({bnOrderConfirm:null}); render(); });
+  var sendBtn = btn(order.side==='BUY' ? 'btn-green' : 'btn-primary',
+    ST.bnLoading ? '⚙️ Enviando...' : (order.side==='BUY' ? '🟢 ENVIAR COMPRA' : '🔴 ENVIAR VENDA'),
+    function() {
+      if (ST.bnLoading) return;
+      submitBnOrder(market, {
+        symbol:    order.symbol,
+        side:      order.side,
+        type:      order.type,
+        quantity:  order.quantity,
+        price:     order.price,
+        stopPrice: order.stopPrice,
+        timeInForce: order.type !== 'MARKET' ? 'GTC' : undefined,
+      });
+    }, ST.bnLoading);
+  sendBtn.style.flex = '1';
+  append(btnRow, cancelConfBtn, sendBtn);
+  modal.appendChild(btnRow);
+  overlay.appendChild(modal);
+  return overlay;
+}
+
+// ================================================================
 // BOOT — A4: assertFreeTierModel na inicialização
 // ================================================================
 (function() {
@@ -4426,4 +5141,6 @@ render();
 //   ws.onmessage = function(ev) { var d = JSON.parse(ev.data); /* update ticker */ };
 //   ws.onerror   = function()    { ws.close(); startBtcPolling(); };  // fallback para polling
 // }
-</script></body></html>
+</script>
+</body>
+</html>

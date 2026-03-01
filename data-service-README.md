@@ -1,105 +1,41 @@
-# Nexus Finance — Data Service
+# Nexus Finance — Data Service v2.0
+## Endpoints Públicos (Market Data)
+- GET /health
+- GET /snapshot?symbols=BTCUSDT&include=macro&tf=1h,4h
+- GET /ticker
+- GET /candles?tf=1h&limit=50
 
-Backend real-time para BTC Trading Desk. Busca dados da Binance com cache TTL inteligente.
+## Endpoints Privados Binance (requerem headers X-Binance-ApiKey + X-Binance-Secret)
 
-## Endpoints
+### Spot
+- GET  /account/spot/balances
+- GET  /account/spot/orders
+- GET  /account/spot/trades?symbol=BTCUSDT&limit=20
+- POST /account/spot/order         body: {symbol, side, type, quantity, price?}
+- DEL  /account/spot/order?symbol=BTCUSDT&orderId=123
 
-| Endpoint | Descrição | Cache TTL |
-|----------|-----------|-----------|
-| `GET /health` | Status do serviço + cache | — |
-| `GET /snapshot` | Snapshot completo (ticker + candles + macro) | Misto |
-| `GET /ticker` | Só preço BTC (polling rápido) | 5s |
-| `GET /candles?tf=1h&limit=50` | Candles OHLCV | 20s–60s |
+### Futures USDT-M
+- GET  /account/futures/balances
+- GET  /account/futures/positions
+- GET  /account/futures/orders
+- GET  /account/futures/trades?symbol=BTCUSDT&limit=20
+- GET  /account/futures/income
+- POST /account/futures/order
+- DEL  /account/futures/order?symbol=BTCUSDT&orderId=123
 
-## Cache TTL (spec A2)
-- Ticker/price: **5s**
-- Candles 1m: **20s**
-- Candles 15m/1h/4h: **60s**
-- Macro (BCB, PTAX): **15min**
+### Filtros
+- GET /account/filters?symbol=BTCUSDT&market=spot
 
----
-
-## Deploy no Cloud Run (recomendado)
-
-### Pré-requisitos
+## Deploy Cloud Run (1 comando)
 ```bash
-# Instalar Google Cloud CLI
-# https://cloud.google.com/sdk/docs/install
-
-gcloud auth login
-gcloud config set project SEU_PROJETO_ID
-```
-
-### Deploy direto (sem Docker local)
-```bash
-cd data-service/
 gcloud run deploy nexus-data-service \
-  --source . \
-  --region us-central1 \
-  --allow-unauthenticated \
-  --memory 256Mi \
-  --cpu 1 \
-  --min-instances 0 \
-  --max-instances 3 \
-  --port 8080
+  --source . --region us-central1 \
+  --allow-unauthenticated --memory 256Mi
 ```
+Cole a URL em Pipeline & IA → Data Service URL.
 
-Cloud Run retorna uma URL tipo:
-`https://nexus-data-service-xxxx-uc.a.run.app`
-
-Cole essa URL no app Nexus Finance em **Pipeline & IA → Data Service URL**.
-
----
-
-## Deploy no Railway (alternativa gratuita)
-
-1. Crie conta em [railway.app](https://railway.app)
-2. New Project → Deploy from GitHub (suba este repo)
-3. Railway detecta o Dockerfile automaticamente
-4. URL gerada: `https://nexus-data-service.railway.app`
-
----
-
-## Deploy no Render (alternativa gratuita)
-
-1. Crie conta em [render.com](https://render.com)
-2. New Web Service → conecte repositório
-3. Runtime: Docker
-4. URL gerada: `https://nexus-data-service.onrender.com`
-
-⚠️ No plano free do Render, o serviço "dorme" após 15min inativo.
-
----
-
-## Testar localmente
-
-```bash
-npm install
-npm start
-
-# Testar endpoints
-curl http://localhost:8080/health
-curl "http://localhost:8080/snapshot?symbols=BTCUSDT&include=macro&tf=1h,4h"
-curl "http://localhost:8080/ticker"
-curl "http://localhost:8080/candles?tf=1h&limit=20"
-```
-
----
-
-## Variáveis de ambiente
-
-| Var | Descrição | Default |
-|-----|-----------|---------|
-| `PORT` | Porta HTTP | `8080` |
-| `ALLOWED_ORIGINS` | CORS origins (vírgula) | `*` |
-
----
-
-## Verificar que está real-time
-
-No topo da página `/btc` do app, você deve ver:
-- **Idade do dado: 1–10s** ✅
-- Status: **OK** (verde)
-- Last update atualizando a cada 10s
-
-Se mostrar > 30s → dado STALE → botão "Rodar Análise" bloqueado automaticamente.
+## Segurança
+- HMAC-SHA256 assinado no servidor (secret NUNCA vai ao browser)
+- API Keys em headers HTTP (não em URL)
+- Rate limit: 120 req/min por IP
+- Use chaves com permissão Leitura + Trading. NUNCA ative Saque.
